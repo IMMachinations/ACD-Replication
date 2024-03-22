@@ -80,7 +80,7 @@ class HackyACDCHookedTransformer():
             raise ValueError("Input and answer must be the same length")
         if(len(inputs) == 0):
             raise ValueError("Input and answer must not be empty")
-        logit_difs = []
+        logit_difs = np.zeros((self.model.cfg.n_layers, self.model.cfg.n_heads))
         heads = []
         
         attn_result = self.model.cfg.use_attn_result
@@ -99,7 +99,7 @@ class HackyACDCHookedTransformer():
                     new_logits[input] = self.model.run_with_hooks(inputs[input], fwd_hooks=[(f"blocks.{layer}.attn.hook_result", lambda hook_value, hook : self.zero_ablate_head_hook_function(head, hook_value, hook))])[0,-1,answer_tokens[input]]
                 logit_dif = (new_logits - original_answer_logits).mean()
                 #print(logit_dif)
-                logit_difs.append(logit_dif)
+                logit_difs[layer, head] = logit_dif
                 if np.abs(logit_dif) < threshold:
                     self.prune_head(layer, head)
                 else:
@@ -107,6 +107,54 @@ class HackyACDCHookedTransformer():
         
         self.model.cfg.use_attn_result = attn_result
         return heads, logit_difs
+    def prune_heads_zeroablation_kldivergence(self, inputs: List[str], answers: List[str], threshold: float = 0.5):
+        if(len(inputs) != len(answers)):
+            raise ValueError("Input and answer must be the same length")
+        if(len(inputs) == 0):
+            raise ValueError("Input and answer must not be empty")
+        num_inputs = len(inputs)
+        KLdivergence_differences = np.zeros((self.model.cfg.n_layers, self.model.cfg.n_heads))
+        heads = []
+        
+        attn_result = self.model.cfg.use_attn_result
+        self.model.cfg.use_attn_result = True
+        
+        answer_tokens = [self.model.to_tokens(answer, prepend_bos=False).tolist()[0][0] for answer in answers]
+        vocab_size = self.model.cfg.d_vocab_out
+        if(vocab_size == -1):
+            vocab_size = self.model.cfg.d_vocab
+        default_probs = t.zeros(num_inputs,vocab_size)
+        for input in range(num_inputs):
+            default_probs[input,:] = nn.Softmax(dim=0)(self.model(inputs[input])[0,-1,:])
+        current_probs = default_probs
+        for layer in tqdm(range(self.model.cfg.n_layers - 1, -1, -1)):
+            
+            #for input in range(len(inputs)):
+            #    normal_logits = self.model(inputs[input])
+            #    original_answer_logits[input,:] = nn.Softmax(dim=0)(normal_logits[0,-1,:])
+                
+            for head in tqdm(range(self.model.cfg.n_heads)):
+                new_logprobs = t.zeros((num_inputs,vocab_size))
+                for input in range(len(inputs)):
+                    new_logprobs[input,:] = nn.Softmax(dim=0)(self.model.run_with_hooks(inputs[input], fwd_hooks=[(f"blocks.{layer}.attn.hook_result", lambda hook_value, hook : self.zero_ablate_head_hook_function(head, hook_value, hook))])[0,-1,:])
+                KLdivergence_difference = nn.KLDivLoss(reduction='batchmean',log_target=True)(default_probs, new_logprobs) - nn.KLDivLoss(reduction='batchmean',log_target=True)(default_probs, current_probs)
+                #print(KLdivergence_difference)
+                KLdivergence_differences[layer,head] = KLdivergence_difference
+                if KLdivergence_difference < threshold:
+                    self.prune_head(layer, head)
+                    current_probs = new_logprobs
+                else:
+                    heads.append((layer, head))
+        
+        self.model.cfg.use_attn_result = attn_result
+        return heads, KLdivergence_differences
+    def prune_edges_zero_ablation_KLdivergence(self, inputs: List[str], answers: List[str], threshold: float = 0.5):
+        if(len(inputs) != len(answers)):
+            raise ValueError("Input and answer must be the same length")
+        if(len(inputs) == 0):
+            raise ValueError("Input and answer must not be empty")
+        num_inputs = len(inputs)
+        
 # %%
 cfg = ACDCConfig()
 hacked_model = HackyACDCHookedTransformer(model, cfg)
@@ -119,5 +167,7 @@ induction_answers = ["ley", "Potter", "establishment", "alt", "Osw"]
 # %%
 heads, logit_difs = hacked_model.prune_heads_zeros(induction_prompts, induction_answers, threshold=0.5)
 # %%
-px.imshow(np.flip(np.array(logit_difs).reshape((12,12)),0))
+px.imshow(logit_difs,  labels=dict(x="Head", y="Layer", color="Logit Dif"))
+# %%
+heads, logit_difs = hacked_model.prune_heads_zeroablation_kldivergence(induction_prompts, induction_answers, threshold=0.05) 
 # %%
