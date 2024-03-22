@@ -148,13 +148,83 @@ class HackyACDCHookedTransformer():
         
         self.model.cfg.use_attn_result = attn_result
         return heads, KLdivergence_differences
-    def prune_edges_zero_ablation_KLdivergence(self, inputs: List[str], answers: List[str], threshold: float = 0.5):
+    
+    def attention_heads_direct_input_selection_hooks(self, cache, edge_list, hook_value, hook):
+        for head in range(len(edge_list)):
+            for edge in edge_list[head]:
+                hook_value[0,:,head,:] -= cache[f'blocks.{edge[0]}.attn.hook_result'][0,:,edge[1],:]
+            return hook_value
+    
+    def prune_head_edges_zero_ablation_KLdivergence(self, inputs: List[str], answers: List[str], threshold: float = 0.5):
         if(len(inputs) != len(answers)):
             raise ValueError("Input and answer must be the same length")
         if(len(inputs) == 0):
             raise ValueError("Input and answer must not be empty")
         num_inputs = len(inputs)
+        answer_tokens = [self.model.to_tokens(answer, prepend_bos=False).tolist()[0][0] for answer in answers]
+        vocab_size = self.model.cfg.d_vocab_out
+        if(vocab_size == -1):
+            vocab_size = self.model.cfg.d_vocab
         
+        attn_result = self.model.cfg.use_attn_result
+        self.model.cfg.use_attn_result = True
+        attn_in = self.model.cfg.use_attn_in
+        self.model.cfg.use_attn_in = True
+        
+        default_probs = t.zeros(num_inputs,vocab_size)
+        for input in range(num_inputs):
+            default_probs[input,:] = nn.Softmax(dim=0)(self.model(inputs[input])[0,-1,:])
+        current_probs = default_probs
+        
+        base_caches = []
+        for input in range(num_inputs):
+            base_caches.append(self.model.run_with_cache(inputs[input])[1])
+        
+        edges = [([] for _ in range(self.model.cfg.n_heads)) for _ in range(self.model.cfg.n_layers)]
+        
+        for layer in range(self.model.cfg.n_layers):
+        for layer in tqdm(range(self.model.cfg.n_layers - 1, -1, -1)):
+            for head in tqdm(range(self.model.cfg.n_heads)):
+                new_caches = []
+                for input in range(num_inputs):
+                    new_caches.append(self.model.run_with_cache(inputs[input], fwd_hooks=[(f"blocks.{layer}.attn.hook_result", lambda hook_value, hook : self.zero_ablate_head_hook_function(head, hook_value, hook))])[1])
+                KLdivergence_difference = 0
+                for input in range(num_inputs):
+                    KLdivergence_difference += nn.KLDivLoss(reduction='batchmean',log_target=True)(base_caches[input], new_caches[input])
+                KLdivergence_difference /= num_inputs
+                if KLdivergence_difference < threshold:
+                    self.prune_head(layer, head)
+                else:
+                    heads.append((layer, head))
+        
+class ACDCNode:
+    def __init__(self, parent_nodes: List[ACDCNode], name: str):
+        self.parent_nodes = parent_nodes
+        self.name = name
+        self.output = None
+        self.input = None
+    
+    def output(self):
+        if(self.output is None):
+            raise ValueError("Output not set")
+        return self.output
+
+    def input(self, shape):
+        if(self.input):
+            if(self.input.shape != shape):
+                raise ValueError("Shape mismatch")
+            return self.input
+        input = t.zeros(shape)
+        for parent in self.parent_nodes:
+            input += parent.output()
+        self.input = input
+        return input
+
+def layered_node_input_hook_function(nodelist: List[ACDCNode], hook_value: Tensor, hook: hook_points.HookPoint):
+    shape = hook_value[0,:,0,:].shape
+    for node in range(len(nodelist)):
+        hook_value[0,:,node,:] = nodelist[node].input(shape)
+
 # %%
 cfg = ACDCConfig()
 hacked_model = HackyACDCHookedTransformer(model, cfg)
