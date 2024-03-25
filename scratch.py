@@ -53,46 +53,48 @@ class ACDCNode():
     def __init(self, name):
         self.parent_nodes = []
         self.name = name
-        self.input = None
-        self.output = None
+        self.hidden_input = None
+        self.hidden_output = None
         
     def __init__(self, parent_nodes: List, name: str):
         self.parent_nodes = parent_nodes
         self.name = name
-        self.output = None
-        self.input = None
+        self.hidden_output = None
+        self.hidden_input = None
     
-    def output(self):
-        if(self.output is None):
+    def set_output(self, hidden_output: Tensor):
+        self.hidden_output = hidden_output
+        
+    def out(self):
+        print(self.hidden_output)
+        if(self.hidden_output is None):
+            print(self)
             raise ValueError("Output not set")
-        return self.output
+        return self.hidden_output
 
     def input(self, shape):
-        if(self.input):
-            if(self.input.shape != shape):
+        if(self.hidden_input):
+            if(self.hidden_input.shape != shape):
                 raise ValueError("Shape mismatch")
-            return self.input
+            return self.hidden_input
         input = t.zeros(shape)
         for parent in self.parent_nodes:
-            input += parent.output()
-        self.input = input
+            input += parent.out()
+        self.hidden_input = input
         return input
     
     def __repr__(self) -> str:
         return self.name
 
 def attention_layer_node_input_hook_function(nodelist: List[ACDCNode], hook_value: Tensor, hook: hook_points.HookPoint):
-    print(nodelist)
-    print(hook.name)
     shape = hook_value[0,:,0,:].shape
     for node in range(len(nodelist)):
-        print(nodelist[node])
         hook_value[0,:,node,:] = nodelist[node].input(shape)
     return hook_value
         
 def attention_layer_node_output_hook_function(nodelist: List[ACDCNode], hook_value: Tensor, hook: hook_points.HookPoint):
     for node in range(len(nodelist)):
-        nodelist[node].output = hook_value[0,:,node,:]
+        nodelist[node].set_output(hook_value[0,:,node,:])
         
 def mlp_layer_node_input_hook_function(node: ACDCNode, hook_value: Tensor, hook: hook_points.HookPoint):
     shape = hook_value[0,:,:].shape
@@ -100,10 +102,11 @@ def mlp_layer_node_input_hook_function(node: ACDCNode, hook_value: Tensor, hook:
     return hook_value
 
 def mlp_layer_node_output_hook_function(node: ACDCNode, hook_value: Tensor, hook: hook_points.HookPoint):
-    node.output = hook_value[0,:,:]
+    node.set_output(hook_value[0,:,:])
     
 def embedding_layer_node_output_hook_function(node: ACDCNode, hook_value: Tensor, hook: hook_points.HookPoint):
-    node.output = hook_value[0,:,:]
+    node.set_output(hook_value[0,:,:])
+    print(node.hidden_output)
 
 def pre_unembedding_layer_node_input_hook_function(node: ACDCNode, hook_value: Tensor, hook: hook_points.HookPoint):
     shape = hook_value[0,:,:].shape
@@ -115,10 +118,10 @@ def add_node_scaffold_to_model(model: HookedTransformer):
     node_tuple_list = []
     previous_nodes = []
     
-    node_tuple_list.append(("Embedding", "","hook_embed", [ACDCNode([], "Embedding")]))
+    node_tuple_list.append(("Embedding", "", "hook_embed", [ACDCNode([], "Embedding")]))
     
     
-    node_tuple_list.append(("Positional Embedding","","hook_pos_embed",[ACDCNode([], "Positional Embedding")]))
+    node_tuple_list.append(("Positional Embedding", "", "hook_pos_embed", [ACDCNode([], "Positional Embedding")]))
     
     previous_nodes.append(node_tuple_list[0][-1][0])
     previous_nodes.append(node_tuple_list[1][-1][0])
@@ -139,8 +142,8 @@ def add_node_scaffold_to_model(model: HookedTransformer):
         
         previous_nodes.append(mlp_layer[0])
     
-    output_node = [ACDCNode(previous_nodes, "Output")]
-    node_tuple_list.append(("Output", f"blocks.{model.cfg.n_layers-1}.hook_resid_post","", output_node))
+    hidden_output_node = [ACDCNode(previous_nodes, "hidden_output")]
+    node_tuple_list.append(("hidden_output", f"blocks.{model.cfg.n_layers-1}.hook_resid_post","", hidden_output_node))
     
     return node_tuple_list
 
@@ -159,16 +162,20 @@ def create_hooks(node_tuple_list: List[Tuple[str, str, str, List[ACDCNode]]]):
             hooks.append((node_tuple_list[layer][2], lambda hook_value, hook : embedding_layer_node_output_hook_function(node_tuple_list[layer][3][0], hook_value, hook)))
         elif(node_tuple_list[layer][0] == "Positional Embedding"):
             hooks.append((node_tuple_list[layer][2], lambda hook_value, hook : embedding_layer_node_output_hook_function(node_tuple_list[layer][3][0], hook_value, hook)))
-        elif(node_tuple_list[layer][0] == "Output"):
+        elif(node_tuple_list[layer][0] == "hidden_output"):
             hooks.append((node_tuple_list[layer][1], lambda hook_value, hook : pre_unembedding_layer_node_input_hook_function(node_tuple_list[layer][3][0], hook_value, hook)))
         else:
             raise ValueError("Layer type not recognized")
     return hooks
         
 # %%
+model = HookedTransformer.from_pretrained("gpt2-small")
 node_tuple_list = add_node_scaffold_to_model(model)
 hooks = create_hooks(node_tuple_list)
 output = model.run_with_hooks("Vernon Dursley and Petunia Durs", fwd_hooks=hooks)
+
+
+
 # %%
 class ACDCConfig:
     def __init__(self):
