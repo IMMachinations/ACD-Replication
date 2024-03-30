@@ -91,6 +91,19 @@ class ACDCNode():
     #def __repr__(self) -> str:
 
     #    return self.name
+    
+class ConstantNode(ACDCNode):
+    def __init__(self, value: Tensor, name: str):
+        self.value = value
+        self.name = name
+    def out(self):
+        return self.value
+    
+    def input(self, shape):
+        return self.value
+    
+    def __str__(self) -> str:
+        return f"Constant Node {self.name}, {self.__repr__()}"
 
 def attention_layer_node_input_hook_function(nodelist: List[ACDCNode], hook_value: Tensor, hook: hook_points.HookPoint):
     print(f"(ATT) Reading from {nodelist} to {hook.name}")
@@ -153,6 +166,8 @@ def add_node_scaffold_to_model(model: HookedTransformer):
                 
         for head in attention_layer:
             previous_nodes.append(head)
+            
+        previous_nodes.append(ConstantNode(model.b_O[layer,:], f"Layer {layer} b_O"))
         
         mlp_layer = ACDCNode(previous_nodes[:], f"Layer {layer} MLP")
         
@@ -168,9 +183,9 @@ def add_node_scaffold_to_model(model: HookedTransformer):
 def create_hooks(embedding_tuple: Tuple[str,str,str,ACDCNode], positional_tuple: Tuple[str,str,str,ACDCNode], layer_node_tuple_list: List[Tuple[str, str, str, List[ACDCNode]]], output_tuple: Tuple[str,str,str,ACDCNode]):   
     hooks = []
     
-    hooks.append((embedding_tuple[1], lambda hook_value, hook : embedding_layer_node_output_hook_function(embedding_tuple[-1], hook_value, hook)))
+    hooks.append((embedding_tuple[1], partial(embedding_layer_node_output_hook_function, embedding_tuple[-1])))
         
-    hooks.append((positional_tuple[1], lambda hook_value, hook : positional_embedding_layer_node_output_hook_function(positional_tuple[-1], hook_value, hook)))
+    hooks.append((positional_tuple[1], partial( positional_embedding_layer_node_output_hook_function, positional_tuple[-1])))
         
     for layer in layer_node_tuple_list:
         if(len(layer) != 4):
@@ -204,8 +219,8 @@ embedding_tuple, positional_tuple, layer_node_tuple_list, output_tuple = add_nod
 hooks = create_hooks(embedding_tuple=embedding_tuple, positional_tuple=positional_tuple, layer_node_tuple_list=layer_node_tuple_list, output_tuple=output_tuple)
 for hook in hooks:
     print(hook)
-hooked_output = model.run_with_hooks("Vernon Dursley and Petunia Durs", fwd_hooks=hooks)
-logits, cache = model.run_with_cache("Vernon Dursley and Petunia Durs")
+hooked_output = model.run_with_hooks("The couch is from Vernon Dursley and Petunia Durs", fwd_hooks=hooks)
+logits, cache = model.run_with_cache("The couch is from Vernon Dursley and Petunia Durs")
 
 
 # %%
