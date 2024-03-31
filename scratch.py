@@ -28,16 +28,23 @@ class ACDCNode():
     
     def __init__(self, name):
         self.parent_nodes = []
+        self.corrupted_parents = []
         self.name = name
         self.hidden_input = None
         self.hidden_output = None
         self.frozen = False
+        self.corrupted_output = {}
+        self.current_key = None
         
     def __init__(self, parent_nodes: List, name: str):
         self.parent_nodes = parent_nodes
+        self.corrupted_parents = []
         self.name = name
         self.hidden_output = None
         self.hidden_input = None
+        self.frozen = False
+        self.corrupted_output = {}
+        self.current_key = None
     
     def freeze(self):
         if(self.hidden_input is None):
@@ -58,31 +65,60 @@ class ACDCNode():
             print(self)
             raise ValueError("Output not set")
         return self.hidden_output
-
-    def input(self, shape):
+    
+    def corrupted_out(self, key: str):
+        if(self.corrupted_output[key] is None):
+            raise ValueError("Output not set")
+        return self.corrupted_output[key]
+    
+    def set_corrupted_output(self, key: str, output: Tensor):
+        self.corrupted_output[key] = output
+    
+    def save_corrupt_output(self, key: str):
+        if(self.hidden_output is None):
+            raise ValueError("Output not set")
+        self.corrupted_output[key] = self.hidden_output
+        return self.hidden_output
+    
+    def input(self, shape, key: str = None):
         if(self.frozen):
             return self.hidden_input
         input = t.zeros(shape)
         for parent in self.parent_nodes:
             input += parent.out()
+        if key is not None:
+            for parent in self.corrupted_parents:
+                input += parent.corrupted_out(key)
+        else:
+            for parent in self.corrupted_parents:
+                input += parent.corrupted_out(self.current_key)
         self.hidden_input = input
         return input
     
     def __str__(self) -> str:
         return f"Node {self.name}, {self.__repr__()}"
-    #def __repr__(self) -> str:
-
-    #    return self.name
+    
     
 class ConstantNode(ACDCNode):
     def __init__(self, value: Tensor, name: str):
         self.parent_nodes = []
         self.value = value
         self.name = name
+        self.corrupted_out = None
+
     def out(self):
         return self.value
     
-    def input(self, shape):
+    def set_corrupted_output(self, key: str, output: Tensor):
+        self.corrupted_out = output
+        
+    def corrupted_out(self, key: str):
+        return self.value
+    
+    def save_corrupt_output(self, key: str):
+        pass    
+    
+    def input(self, shape, key: str = None):
         return self.value
     
     def __str__(self) -> str:
@@ -207,10 +243,69 @@ hooked_output = model.run_with_hooks("Vernon Dursley and Petunia Durs", fwd_hook
 logits, cache = model.run_with_cache("Vernon Dursley and Petunia Durs")
 
 # %%
-def prune_node(node: ACDCNode, hooks: List[Tuple[str, Callable]], model: HookedTransformer, prompt: str, prune_value: Float = 1.0):
+def zero_prune_node(node: ACDCNode, hooks: List[Tuple[str, Callable]], model: HookedTransformer, prompts: List[str], prune_value: Float = 1.0):
+    base_logits = t.zeros((len(prompts), model.cfg.d_vocab))
+    base_logits = nn.Softmax(dim=-1)(base_logits)
+    for index, prompt in enumerate(prompts):
+        base_logits[index,:] =  model.run_with_hooks(prompt, fwd_hooks=hooks)[0,-1,:]
+    
     for index in range(len(node.parent_nodes) - 1, -1, -1):
-        old_logits = model.run_with_hooks("Vernon Dursley and Petunia Durs", fwd_hooks=hooks)
+        old_logits = t.zeros((len(prompts), model.cfg.d_vocab))
+        for index, prompt in enumerate(prompts):
+            old_logits[index,:] = model.run_with_hooks(prompt, fwd_hooks=hooks)[0,-1,:]
+        old_logits = nn.Softmax(dim=-1)(old_logits)
         parent_node = node.parent_nodes.pop(index)
-        new_logits = model.run_with_hooks("Vernon Dursley and Petunia Durs", fwd_hooks=hooks)
-        KLDivergence_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)(old_logits[0,-1,:], new_logits[0,-1,:])
-        print(KLDivergence_loss)
+        new_logits = t.zeros((len(prompts), model.cfg.d_vocab))
+        for index, prompt in enumerate(prompts):
+            new_logits[index,:] = model.run_with_hooks(prompt, fwd_hooks=hooks)[0,-1,:]
+        new_logits = nn.Softmax(dim=-1)(new_logits)
+        old_KLDivergence_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)(old_logits, base_logits)
+        new_KLDivergence_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)(new_logits, base_logits)
+        
+        print(new_KLDivergence_loss - old_KLDivergence_loss)
+        if(new_KLDivergence_loss - old_KLDivergence_loss >= prune_value):
+            node.parent_nodes.append(parent_node)
+            
+def alternate_run_prune_node(node: ACDCNode, hooks: List[Tuple[str, Callable]], model: HookedTransformer, prompts: List[Tuple[str,str]], prune_value: Float = 1.0):
+    base_logits = t.zeros((len(prompts), model.cfg.d_vocab))
+    base_logits = nn.Softmax(dim=-1)(base_logits)
+    for index, prompt in enumerate(prompts):
+        base_logits[index,:] =  model.run_with_hooks(prompt[0], fwd_hooks=hooks)[0,-1,:]
+        for parent in node.parent_nodes:
+            parent.save_corrupt_output(prompt[0])
+
+    for index in range(len(node.parent_nodes) - 1, -1, -1):
+        old_logits = t.zeros((len(prompts), model.cfg.d_vocab))
+        for index, prompt in enumerate(prompts):
+            node.current_key = prompt[0]
+            old_logits[index,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
+        old_logits = nn.Softmax(dim=-1)(old_logits)
+        node.corrupted_parents.append(node.parent_nodes.pop(index))
+        new_logits = t.zeros((len(prompts), model.cfg.d_vocab))
+        for index, prompt in enumerate(prompts):
+            node.current_key = prompt[0]
+            new_logits[index,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
+        new_logits = nn.Softmax(dim=-1)(new_logits)
+        old_KLDivergence_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)(old_logits, base_logits)
+        new_KLDivergence_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)(new_logits, base_logits)
+        
+        print(new_KLDivergence_loss - old_KLDivergence_loss)
+        if(new_KLDivergence_loss - old_KLDivergence_loss >= prune_value):
+            node.parent_nodes.append(node.corrupted_parents.pop())
+# %%
+prompts = [("Vernon the great and Petunia Durs", "Vernon Dursley and Petunia Durs"), 
+           ("The second largest is Duluth. In Minnesota, Dul", "The second largest is Saint Paul. In Minnesota, Dul"),
+           ("The capital of Minnesota is St. Paul. The patron saint of missionaries is St", "The capital of Minnesota is in Saint Paul. The patron saint of missionaries is St"),
+           ("Jan and Dursley went to the beach. Cos","Jan and Cosette went to the beach. Cos"),
+           ("My name is Calista. I am Cal", "My name is John Smith. I am Cal") ]
+model = HookedTransformer.from_pretrained("gpt2-small")
+model.cfg.use_attn_in = True
+model.cfg.use_attn_result = True
+model.cfg.use_hook_mlp_in = True
+embedding_tuple, positional_tuple, layer_node_tuple_list, output_tuple, nodes = add_node_scaffold_to_model(model)
+
+hooks = create_hooks(embedding_tuple=embedding_tuple, positional_tuple=positional_tuple, layer_node_tuple_list=layer_node_tuple_list, output_tuple=output_tuple)
+
+
+alternate_run_prune_node(nodes[-1], hooks, model, prompts, prune_value=1000000)
+# %%
