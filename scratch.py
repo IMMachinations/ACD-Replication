@@ -104,19 +104,23 @@ class ConstantNode(ACDCNode):
         self.parent_nodes = []
         self.value = value
         self.name = name
-        self.corrupted_out = None
+        self.corrupted_values = {}
+        self.current_key = None
 
     def out(self):
         return self.value
     
     def set_corrupted_output(self, key: str, output: Tensor):
-        self.corrupted_out = output
+        self.corrupted_values[key] = output
         
     def corrupted_out(self, key: str):
+        if key in self.corrupted_values.keys():
+            return self.corrupted_values[key]
         return self.value
     
     def save_corrupt_output(self, key: str):
-        pass    
+        if(False):
+            self.corrupted_values[key] = self.value
     
     def input(self, shape, key: str = None):
         return self.value
@@ -266,38 +270,47 @@ def zero_prune_node(node: ACDCNode, hooks: List[Tuple[str, Callable]], model: Ho
         if(new_KLDivergence_loss - old_KLDivergence_loss >= prune_value):
             node.parent_nodes.append(parent_node)
             
-def alternate_run_prune_node(node: ACDCNode, hooks: List[Tuple[str, Callable]], model: HookedTransformer, prompts: List[Tuple[str,str]], prune_value: Float = 1.0):
+def alternate_run_prune_node(node: ACDCNode, all_nodes: List[ACDCNode], hooks: List[Tuple[str, Callable]], model: HookedTransformer, prompts: List[Tuple[str,str]], prune_value: Float = 1.0):
+    kl_divergence_losses = []
     base_logits = t.zeros((len(prompts), model.cfg.d_vocab))
     base_logits = nn.Softmax(dim=-1)(base_logits)
     for index, prompt in enumerate(prompts):
         base_logits[index,:] =  model.run_with_hooks(prompt[0], fwd_hooks=hooks)[0,-1,:]
-        for parent in node.parent_nodes:
-            parent.save_corrupt_output(prompt[0])
+        for iter_node in all_nodes[:-1]:
+            iter_node.save_corrupt_output(prompt[0])
 
-    for index in range(len(node.parent_nodes) - 1, -1, -1):
+    for index in tqdm(range(len(node.parent_nodes) - 1, -1, -1)):
         old_logits = t.zeros((len(prompts), model.cfg.d_vocab))
-        for index, prompt in enumerate(prompts):
+        for i, prompt in enumerate(prompts):
+            for iter_node in all_nodes[:-1]:
+                iter_node.current_key = prompt[0]
             node.current_key = prompt[0]
-            old_logits[index,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
+            old_logits[i,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
         old_logits = nn.Softmax(dim=-1)(old_logits)
         node.corrupted_parents.append(node.parent_nodes.pop(index))
         new_logits = t.zeros((len(prompts), model.cfg.d_vocab))
-        for index, prompt in enumerate(prompts):
+        for i, prompt in enumerate(prompts):
             node.current_key = prompt[0]
-            new_logits[index,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
+            new_logits[i,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
         new_logits = nn.Softmax(dim=-1)(new_logits)
+        
         old_KLDivergence_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)(old_logits, base_logits)
         new_KLDivergence_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)(new_logits, base_logits)
         
-        print(new_KLDivergence_loss - old_KLDivergence_loss)
-        if(new_KLDivergence_loss - old_KLDivergence_loss >= prune_value):
+        kl_difference = t.abs(new_KLDivergence_loss - old_KLDivergence_loss)
+        kl_divergence_losses.append(kl_difference.detach())
+        if(kl_difference >= prune_value):
             node.parent_nodes.append(node.corrupted_parents.pop())
+            #print(list(map(str, node.corrupted_parents)))
+    return kl_divergence_losses
+            
 # %%
-prompts = [("Vernon the great and Petunia Durs", "Vernon Dursley and Petunia Durs"), 
+prompts = [("Vernon Thornefield and Petunia Durs", "Vernon Dursley and Petunia Durs"), 
            ("The second largest is Duluth. In Minnesota, Dul", "The second largest is Saint Paul. In Minnesota, Dul"),
            ("The capital of Minnesota is St. Paul. The patron saint of missionaries is St", "The capital of Minnesota is in Saint Paul. The patron saint of missionaries is St"),
-           ("Jan and Dursley went to the beach. Cos","Jan and Cosette went to the beach. Cos"),
+           ("Jan and Clementine went to the beach. Cos","Jan and Cosette went to the beach. Cos"),
            ("My name is Calista. I am Cal", "My name is John Smith. I am Cal") ]
+
 model = HookedTransformer.from_pretrained("gpt2-small")
 model.cfg.use_attn_in = True
 model.cfg.use_attn_result = True
@@ -306,6 +319,16 @@ embedding_tuple, positional_tuple, layer_node_tuple_list, output_tuple, nodes = 
 
 hooks = create_hooks(embedding_tuple=embedding_tuple, positional_tuple=positional_tuple, layer_node_tuple_list=layer_node_tuple_list, output_tuple=output_tuple)
 
+a = 1
+b = 2
+first_losses = alternate_run_prune_node(nodes[-1], nodes, hooks, model, prompts[a:a+b], prune_value=500000)
+second_losses = alternate_run_prune_node(nodes[-2], nodes, hooks, model, prompts[a:a+b], prune_value=500000)
+# %%
 
-alternate_run_prune_node(nodes[-1], hooks, model, prompts, prune_value=1000000)
+# %%
+for prompt in prompts:
+    
+    print(len(model.to_str_tokens(prompt[0])) == len(model.to_str_tokens(prompt[1])) )
+    print(model.to_str_tokens(prompt[0]))
+    print(model.to_str_tokens(prompt[1]))
 # %%
