@@ -336,7 +336,14 @@ embedding_tuple, positional_tuple, layer_node_tuple_list, output_tuple, nodes = 
 hooks = create_hooks(embedding_tuple=embedding_tuple, positional_tuple=positional_tuple, layer_node_tuple_list=layer_node_tuple_list, output_tuple=output_tuple)
 
 for i in range(len(nodes) - 1, -1, -1):
-    alternate_run_prune_node(nodes[i], nodes, hooks, model, prompts, prune_value=5000000)
+    is_relevant = False
+    for node in nodes:
+        if node[i] in node.parent_nodes:
+            is_relevant = True
+            break
+    
+    if is_relevant:        
+        alternate_run_prune_node(nodes[i], nodes, hooks, model, prompts, prune_value=5000000)
 
 #first_losses = alternate_run_prune_node(nodes[-1], nodes, hooks, model, prompts, prune_value=500000)
 #%%
