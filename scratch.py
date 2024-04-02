@@ -26,7 +26,7 @@ model = HookedTransformer.from_pretrained("gpt2-small")
 #%%
 class ACDCNode():
     
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.parent_nodes = []
         self.corrupted_parents = []
         self.name = name
@@ -83,17 +83,27 @@ class ACDCNode():
     def input(self, shape, key: str = None):
         if(self.frozen):
             return self.hidden_input
-        input = t.zeros(shape)
+        node_input = t.zeros(shape)
         for parent in self.parent_nodes:
-            input += parent.out()
+            node_input += parent.out()
         if key is not None:
             for parent in self.corrupted_parents:
-                input += parent.corrupted_out(key)
+                node_input += parent.corrupted_out(key)
         else:
             for parent in self.corrupted_parents:
-                input += parent.corrupted_out(self.current_key)
-        self.hidden_input = input
-        return input
+                try:
+                    node_input += parent.corrupted_out(self.current_key)
+                except BaseException as e:
+                    print(self.name)
+                    print(self.current_key)
+                    print(parent.name)
+                    print(parent.corrupted_output.keys())
+                    for key, tensor in parent.corrupted_output.items():
+                        print(f"{key}: {tensor.shape}")
+                    raise e
+                    
+        self.hidden_input = node_input
+        return node_input
     
     def __str__(self) -> str:
         return f"Node {self.name}, {self.__repr__()}"
@@ -275,21 +285,27 @@ def alternate_run_prune_node(node: ACDCNode, all_nodes: List[ACDCNode], hooks: L
     base_logits = t.zeros((len(prompts), model.cfg.d_vocab))
     base_logits = nn.Softmax(dim=-1)(base_logits)
     for index, prompt in enumerate(prompts):
+        for iter_node in all_nodes:
+            iter_node.current_key = prompt[0]
         base_logits[index,:] =  model.run_with_hooks(prompt[0], fwd_hooks=hooks)[0,-1,:]
         for iter_node in all_nodes[:-1]:
             iter_node.save_corrupt_output(prompt[0])
 
     for index in tqdm(range(len(node.parent_nodes) - 1, -1, -1)):
+        
         old_logits = t.zeros((len(prompts), model.cfg.d_vocab))
         for i, prompt in enumerate(prompts):
-            for iter_node in all_nodes[:-1]:
+            for iter_node in all_nodes:
                 iter_node.current_key = prompt[0]
             node.current_key = prompt[0]
             old_logits[i,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
         old_logits = nn.Softmax(dim=-1)(old_logits)
         node.corrupted_parents.append(node.parent_nodes.pop(index))
+        
         new_logits = t.zeros((len(prompts), model.cfg.d_vocab))
         for i, prompt in enumerate(prompts):
+            for iter_node in all_nodes:
+                iter_node.current_key = prompt[0]
             node.current_key = prompt[0]
             new_logits[i,:] = model.run_with_hooks(prompt[1], fwd_hooks=hooks)[0,-1,:]
         new_logits = nn.Softmax(dim=-1)(new_logits)
@@ -306,10 +322,10 @@ def alternate_run_prune_node(node: ACDCNode, all_nodes: List[ACDCNode], hooks: L
             
 # %%
 prompts = [("Vernon Thornefield and Petunia Durs", "Vernon Dursley and Petunia Durs"), 
-           ("The second largest is Duluth. In Minnesota, Dul", "The second largest is Saint Paul. In Minnesota, Dul"),
-           ("The capital of Minnesota is St. Paul. The patron saint of missionaries is St", "The capital of Minnesota is in Saint Paul. The patron saint of missionaries is St"),
+           ("The second largest is Saint Paul. In Minnesota, Dul", "The second largest is Duluth. In Minnesota, Dul"),
+           ("The capital of Minnesota is in Saint Paul. The patron saint of missionaries is St", "The capital of Minnesota is St. Paul. The patron saint of missionaries is St" ),
            ("Jan and Clementine went to the beach. Cos","Jan and Cosette went to the beach. Cos"),
-           ("My name is Calista. I am Cal", "My name is John Smith. I am Cal") ]
+           ("My name is John Smith. I am Cal", "My name is Calista. I am Cal") ]
 
 model = HookedTransformer.from_pretrained("gpt2-small")
 model.cfg.use_attn_in = True
@@ -319,16 +335,20 @@ embedding_tuple, positional_tuple, layer_node_tuple_list, output_tuple, nodes = 
 
 hooks = create_hooks(embedding_tuple=embedding_tuple, positional_tuple=positional_tuple, layer_node_tuple_list=layer_node_tuple_list, output_tuple=output_tuple)
 
-a = 1
-b = 2
-first_losses = alternate_run_prune_node(nodes[-1], nodes, hooks, model, prompts[a:a+b], prune_value=500000)
-second_losses = alternate_run_prune_node(nodes[-2], nodes, hooks, model, prompts[a:a+b], prune_value=500000)
-# %%
+for i in range(len(nodes) - 1, -1, -1):
+    alternate_run_prune_node(nodes[i], nodes, hooks, model, prompts, prune_value=5000000)
 
+#first_losses = alternate_run_prune_node(nodes[-1], nodes, hooks, model, prompts, prune_value=500000)
+#%%
+#second_losses = alternate_run_prune_node(nodes[-2], nodes, hooks, model, prompts, prune_value=500000)
+# %%
+#third_losses = alternate_run_prune_node(nodes[-3], nodes, hooks, model, prompts, prune_value=500000)
 # %%
 for prompt in prompts:
     
     print(len(model.to_str_tokens(prompt[0])) == len(model.to_str_tokens(prompt[1])) )
+    print(len(model.to_str_tokens(prompt[0])))
+    print(len(model.to_str_tokens(prompt[1])))
     print(model.to_str_tokens(prompt[0]))
     print(model.to_str_tokens(prompt[1]))
 # %%
